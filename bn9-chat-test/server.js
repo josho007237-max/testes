@@ -9,7 +9,7 @@ app.post("/api/chat", async (req, res) => {
   if (!message) return res.status(400).json({ error: "missing message" });
 
   try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -24,11 +24,11 @@ app.post("/api/chat", async (req, res) => {
       }),
     });
 
-    const data = await resp.json();
+    const data = await r.json();
     const reply = data?.choices?.[0]?.message?.content || "พี่พลอยตอบไม่ออกค่า 😅";
     res.json({ reply });
-  } catch (err) {
-    console.error(err);
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "OpenAI failed" });
   }
 });
@@ -37,4 +37,3 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log("✅ Chat backend ready on port", PORT));
-
