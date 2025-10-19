@@ -19,7 +19,7 @@ app.post("/api/chat", async (req, res) => {
         model: "gpt-4o-mini",
         messages: [
           { role: "system", content: "คุณคือพี่พลอย BN9 แอดมินผู้ช่วย พูดสุภาพ อบอุ่น" },
-          { role: "user", content: message },
+          { role: "user", content: message }
         ],
       }),
     });
@@ -37,3 +37,4 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log("✅ Chat backend ready on port", PORT));
+
