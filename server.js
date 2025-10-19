@@ -3,13 +3,16 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 
 // ===== CONFIG =====
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const LINE_TOKEN      = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const LINE_SECRET     = process.env.LINE_CHANNEL_SECRET;
-const PORT            = process.env.PORT || 3001;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;        // ใช้คีย์แบบ sk-xxxx
+const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const LINE_TOKEN     = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const LINE_SECRET    = process.env.LINE_CHANNEL_SECRET;
+const PORT           = process.env.PORT || 3001;
 
 // จำกัดจำนวนข้อความ/คน สำหรับตัวเทส
 const MAX_TURNS = 10;
+// timeout รวม (ms) สำหรับเรียก OpenAI ใน webhook — อย่าให้เกิน 8–9s
+const OPENAI_TIMEOUT_MS = 8000;
 
 // โอกาสส่งสติ๊กเกอร์สุ่ม (0.0 - 1.0)
 const STICKER_PROBABILITY = 0.35;
@@ -62,27 +65,40 @@ function chunkText(text, maxLen = 350) {
 }
 
 async function askOpenAI(message) {
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: SYSTEM_HINT },
-        { role: "user",   content: message }
-      ],
-      temperature: 0.7
-    })
-  });
-  const data = await r.json();
-  if (!r.ok) {
-    console.error("OpenAI error:", data);
-    throw new Error("OpenAI failed");
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), OPENAI_TIMEOUT_MS);
+
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      signal: ctrl.signal,
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [
+          { role: "system", content: SYSTEM_HINT },
+          { role: "user",   content: message }
+        ],
+        temperature: 0.7
+      })
+    });
+
+    const text = await r.text();
+    if (!r.ok) {
+      // log รายละเอียดไว้ดูใน Railway
+      console.error("OpenAI error:", r.status, text);
+      throw new Error(`OpenAI ${r.status}`);
+    }
+    const data = JSON.parse(text);
+    return data?.choices?.[0]?.message?.content?.trim() || "โอเคค่ะ";
+  } finally {
+    clearTimeout(t);
   }
-  return data?.choices?.[0]?.message?.content || "พี่พลอยตอบไม่ออกค่า 😅";
 }
 
 async function lineReply(replyToken, messages) {
@@ -105,71 +121,92 @@ app.post("/api/chat", async (req, res) => {
     res.json({ reply });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "OpenAI failed" });
+    res.status(200).json({ reply: "ขออภัย ตอนนี้ระบบหลักมีปัญหาเล็กน้อยค่ะ 🙏" });
   }
 });
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
+app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
 
 // ===== LINE Webhook =====
 app.post("/webhooks/line", async (req, res) => {
+  // ป้องกัน 500/499: ตอบ 200 ให้ LINE เสมอ (แล้วค่อยทำงานต่อภายใน)
+  // สำหรับ flow ที่ต้องใช้ replyToken จำเป็นต้องตอบใน 1 ครั้งนี้อยู่ดี
+  // ดังนั้นเราจะพยายามให้เสร็จภายใน timeout และกัน error ทุกจุด
   try {
     // 1) ตรวจลายเซ็น
     const signature = req.get("x-line-signature");
+    if (!LINE_SECRET) {
+      console.error("Missing LINE_CHANNEL_SECRET");
+      return res.status(200).send("ok"); // อย่าล้ม webhook
+    }
     const hmac = crypto.createHmac("sha256", LINE_SECRET);
-    hmac.update(req.rawBody);
-    if (signature !== hmac.digest("base64")) {
-      return res.status(401).send("bad signature");
+    hmac.update(req.rawBody || Buffer.from(""));
+    const expected = hmac.digest("base64");
+    if (signature !== expected) {
+      console.warn("bad signature");
+      return res.status(200).send("ok");
     }
 
     const { events = [] } = req.body || {};
     await Promise.all(events.map(async (ev) => {
-      if (ev.type !== "message" || ev.message?.type !== "text") return;
+      try {
+        if (ev.type !== "message" || ev.message?.type !== "text") return;
 
-      const userId = ev.source?.userId || "anon";
-      const textIn = ev.message.text?.trim() || "";
+        const userId = ev.source?.userId || "anon";
+        const textIn = (ev.message.text || "").trim();
 
-      // 2) นับรอบ
-      const now  = Date.now();
-      const info = turns.get(userId) || { count: 0, ts: now };
-      info.count += 1;
-      info.ts = now;
-      turns.set(userId, info);
+        // 2) นับรอบ
+        const now  = Date.now();
+        const info = turns.get(userId) || { count: 0, ts: now };
+        info.count += 1;
+        info.ts = now;
+        turns.set(userId, info);
 
-      // 3) ถ้าครบโควต้า → ส่งปิดงานเทส
-      if (info.count >= MAX_TURNS) {
-        const msgs = [
-          { type: "text", text: GOODBYE_TEXT },
-          ...(Math.random() < 0.8 ? [{ type: "sticker", ...randSticker() }] : [])
-        ];
-        await lineReply(ev.replyToken, msgs);
-        return;
+        // 3) ครบโควต้า → ส่งปิดงานเทส
+        if (info.count >= MAX_TURNS) {
+          const msgs = [
+            { type: "text", text: GOODBYE_TEXT },
+            ...(Math.random() < 0.8 ? [{ type: "sticker", ...randSticker() }] : [])
+          ];
+          await lineReply(ev.replyToken, msgs);
+          return;
+        }
+
+        // 4) ถาม GPT (ถ้าล้มจะ fallback)
+        let answer = "ขออภัย ระบบกำลังตั้งค่าคีย์ใหม่อยู่ค่ะ 🙏";
+        try {
+          answer = await askOpenAI(textIn);
+        } catch (err) {
+          console.error("OpenAI failed:", err?.message);
+        }
+
+        // 5) แบ่งตอน + สติ๊กเกอร์สุ่ม
+        const parts = chunkText(answer, 350).slice(0, 3);
+        const messages = [];
+
+        if (Math.random() < STICKER_PROBABILITY) {
+          messages.push({ type: "sticker", ...randSticker() });
+        }
+
+        parts.forEach((p, i) => {
+          const head = parts.length > 1 ? `(${i + 1}/${parts.length}) ` : "";
+          const tail = (i === parts.length - 1 && Math.random() < 0.25) ? " 🩷" : "";
+          messages.push({ type: "text", text: `${head}${p}${tail}`.slice(0, 490) });
+        });
+
+        await lineReply(ev.replyToken, messages);
+      } catch (inner) {
+        console.error("handle event error:", inner);
+        // อย่าปล่อยให้ event ใด event เดียวทำให้ทั้ง webhook ล้ม
       }
-
-      // 4) ถาม GPT
-      const gpt = await askOpenAI(textIn);
-
-      // 5) แบ่งตอน 1/2/3 + สติ๊กเกอร์สุ่ม + อ้อนนิดๆ
-      const parts = chunkText(gpt, 350).slice(0, 3);
-      const messages = [];
-
-      if (Math.random() < STICKER_PROBABILITY) {
-        messages.push({ type: "sticker", ...randSticker() });
-      }
-
-      parts.forEach((p, i) => {
-        const head = parts.length > 1 ? `(${i + 1}/${parts.length}) ` : "";
-        const tail = (i === parts.length - 1 && Math.random() < 0.25) ? " 🩷" : "";
-        messages.push({ type: "text", text: `${head}${p}${tail}`.slice(0, 490) });
-      });
-
-      await lineReply(ev.replyToken, messages);
     }));
 
-    res.status(200).send("ok");
+    return res.status(200).send("ok");
   } catch (e) {
-    console.error("LINE webhook error:", e);
-    res.status(500).send("error");
+    console.error("LINE webhook fatal:", e);
+    // ส่ง 200 กลับไปอยู่ดี เพื่อตัด 500/499
+    return res.status(200).send("ok");
   }
 });
 
@@ -177,5 +214,3 @@ app.post("/webhooks/line", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ BN9 test bot running on :${PORT}`);
 });
-
-
