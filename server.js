@@ -1,9 +1,8 @@
 import express from "express";
-import fetch from "node-fetch";
 import crypto from "crypto";
 
 // ===== CONFIG =====
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;        // ใช้คีย์แบบ sk-xxxx
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;        // ต้องเป็น sk-xxxxxx เท่านั้น
 const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const LINE_TOKEN     = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_SECRET    = process.env.LINE_CHANNEL_SECRET;
@@ -11,7 +10,6 @@ const PORT           = process.env.PORT || 3001;
 
 // จำกัดจำนวนข้อความ/คน สำหรับตัวเทส
 const MAX_TURNS = 10;
-// timeout รวม (ms) สำหรับเรียก OpenAI ใน webhook — อย่าให้เกิน 8–9s
 const OPENAI_TIMEOUT_MS = 8000;
 
 // โอกาสส่งสติ๊กเกอร์สุ่ม (0.0 - 1.0)
@@ -37,12 +35,10 @@ const GOODBYE_TEXT =
 
 // ===== APP =====
 const app = express();
-// เก็บ raw body เพื่อเช็คลายเซ็น LINE
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; }}));
 
-// หน่วยความจำจำกัดรอบต่อผู้ใช้ (RAM)
 const turns = new Map(); // userId -> { count:number, ts:number }
-setInterval(() => turns.clear(), 24 * 60 * 60 * 1000); // ล้างทุก 24 ชม.
+setInterval(() => turns.clear(), 24 * 60 * 60 * 1000);
 
 // ===== Helpers =====
 function randSticker() {
@@ -90,10 +86,10 @@ async function askOpenAI(message) {
 
     const text = await r.text();
     if (!r.ok) {
-      // log รายละเอียดไว้ดูใน Railway
       console.error("OpenAI error:", r.status, text);
       throw new Error(`OpenAI ${r.status}`);
     }
+
     const data = JSON.parse(text);
     return data?.choices?.[0]?.message?.content?.trim() || "โอเคค่ะ";
   } finally {
@@ -112,7 +108,7 @@ async function lineReply(replyToken, messages) {
   });
 }
 
-// ===== HTTP Demo (คงไว้) =====
+// ===== HTTP Demo =====
 app.post("/api/chat", async (req, res) => {
   try {
     const msg = req.body?.message;
@@ -130,16 +126,13 @@ app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
 
 // ===== LINE Webhook =====
 app.post("/webhooks/line", async (req, res) => {
-  // ป้องกัน 500/499: ตอบ 200 ให้ LINE เสมอ (แล้วค่อยทำงานต่อภายใน)
-  // สำหรับ flow ที่ต้องใช้ replyToken จำเป็นต้องตอบใน 1 ครั้งนี้อยู่ดี
-  // ดังนั้นเราจะพยายามให้เสร็จภายใน timeout และกัน error ทุกจุด
   try {
-    // 1) ตรวจลายเซ็น
     const signature = req.get("x-line-signature");
     if (!LINE_SECRET) {
       console.error("Missing LINE_CHANNEL_SECRET");
-      return res.status(200).send("ok"); // อย่าล้ม webhook
+      return res.status(200).send("ok");
     }
+
     const hmac = crypto.createHmac("sha256", LINE_SECRET);
     hmac.update(req.rawBody || Buffer.from(""));
     const expected = hmac.digest("base64");
@@ -156,14 +149,12 @@ app.post("/webhooks/line", async (req, res) => {
         const userId = ev.source?.userId || "anon";
         const textIn = (ev.message.text || "").trim();
 
-        // 2) นับรอบ
         const now  = Date.now();
         const info = turns.get(userId) || { count: 0, ts: now };
         info.count += 1;
         info.ts = now;
         turns.set(userId, info);
 
-        // 3) ครบโควต้า → ส่งปิดงานเทส
         if (info.count >= MAX_TURNS) {
           const msgs = [
             { type: "text", text: GOODBYE_TEXT },
@@ -173,7 +164,6 @@ app.post("/webhooks/line", async (req, res) => {
           return;
         }
 
-        // 4) ถาม GPT (ถ้าล้มจะ fallback)
         let answer = "ขออภัย ระบบกำลังตั้งค่าคีย์ใหม่อยู่ค่ะ 🙏";
         try {
           answer = await askOpenAI(textIn);
@@ -181,7 +171,6 @@ app.post("/webhooks/line", async (req, res) => {
           console.error("OpenAI failed:", err?.message);
         }
 
-        // 5) แบ่งตอน + สติ๊กเกอร์สุ่ม
         const parts = chunkText(answer, 350).slice(0, 3);
         const messages = [];
 
@@ -198,14 +187,12 @@ app.post("/webhooks/line", async (req, res) => {
         await lineReply(ev.replyToken, messages);
       } catch (inner) {
         console.error("handle event error:", inner);
-        // อย่าปล่อยให้ event ใด event เดียวทำให้ทั้ง webhook ล้ม
       }
     }));
 
     return res.status(200).send("ok");
   } catch (e) {
     console.error("LINE webhook fatal:", e);
-    // ส่ง 200 กลับไปอยู่ดี เพื่อตัด 500/499
     return res.status(200).send("ok");
   }
 });
